@@ -17,6 +17,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# ── Activate virtual environment ─────────────────────────────────────────────
+if [ -d "$PROJECT_DIR/.venv" ]; then
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/.venv/bin/activate"
+else
+    echo "ERROR: Virtual environment not found. Run ./scripts/setup_venv.sh first." >&2
+    exit 1
+fi
+
 NUM_STEPS="${1:-100}"
 SIZE_FILTER="${2:-all}"   # "all", "small", "medium", "large", "xlarge"
 BATCH_SIZE="${3:-8}"

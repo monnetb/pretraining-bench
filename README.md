@@ -19,6 +19,11 @@ with multiple precision modes and model configurations.
 ## Quick Start
 
 ```bash
+# 1. Create the virtual environment and install dependencies
+./scripts/setup_venv.sh          # or: ./scripts/setup_venv.sh --dev  (includes ruff, pytest)
+
+# 2. Run benchmarks (scripts auto-activate the venv)
+
 # Single GPU, small model, BF16 baseline
 ./scripts/run_single_gpu.sh
 
@@ -141,6 +146,7 @@ transformer-bench/
 │   ├── distributed.py          # FSDP2 setup
 │   └── report.py               # Console table, JSON, CSV
 ├── scripts/
+│   ├── setup_venv.sh              # Create venv and install deps
 │   ├── run_single_gpu.sh       # Single GPU launcher
 │   ├── run_multi_gpu.sh        # Multi-GPU (torchrun) launcher
 │   └── run_full_sweep.sh       # Full matrix sweep
