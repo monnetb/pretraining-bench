@@ -26,6 +26,15 @@ else
     exit 1
 fi
 
+# ── Ensure pip-installed CUDA libs (cuBLAS 13, etc.) are visible to the linker ─
+_SITE_PKGS="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+for _nvidia_lib in "$_SITE_PKGS"/nvidia/*/lib; do
+    [ -d "$_nvidia_lib" ] && export LD_LIBRARY_PATH="${_nvidia_lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
+
+# ── Work around cuDNN sublibrary loading failures with TE fused attention ─
+export NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}"
+
 NUM_STEPS="${1:-100}"
 SIZE_FILTER="${2:-all}"   # "all", "small", "medium", "large", "xlarge"
 BATCH_SIZE="${3:-8}"

@@ -94,7 +94,7 @@ def detect_gpu_capabilities() -> GPUCapabilities:
     device = torch.cuda.current_device()
     gpu_name = torch.cuda.get_device_name(device)
     cc = torch.cuda.get_device_capability(device)
-    mem_bytes = torch.cuda.get_device_properties(device).total_mem
+    mem_bytes = torch.cuda.get_device_properties(device).total_memory
     num_gpus = torch.cuda.device_count()
 
     caps = GPUCapabilities(
@@ -105,27 +105,33 @@ def detect_gpu_capabilities() -> GPUCapabilities:
     )
 
     # Probe TransformerEngine precision support
-    import transformer_engine.pytorch as te_pytorch
-
     try:
-        caps.has_fp8 = te_pytorch.is_fp8_available()
-    except Exception:
-        caps.has_fp8 = False
+        import transformer_engine.pytorch as te_pytorch
+        _te_available = True
+    except (ImportError, OSError) as e:
+        logger.warning(f"TransformerEngine not available ({e}). FP8/MXFP8/NVFP4 disabled.")
+        _te_available = False
 
-    try:
-        caps.has_mxfp8 = te_pytorch.is_mxfp8_available()
-    except (AttributeError, Exception):
-        caps.has_mxfp8 = False
+    if _te_available:
+        try:
+            caps.has_fp8 = te_pytorch.is_fp8_available()
+        except Exception:
+            caps.has_fp8 = False
 
-    try:
-        caps.has_nvfp4 = te_pytorch.is_nvfp4_available()
-    except (AttributeError, Exception):
-        caps.has_nvfp4 = False
+        try:
+            caps.has_mxfp8 = te_pytorch.is_mxfp8_available()
+        except (AttributeError, Exception):
+            caps.has_mxfp8 = False
 
-    try:
-        caps.has_fp8_block_scaling = te_pytorch.is_fp8_block_scaling_available()
-    except (AttributeError, Exception):
-        caps.has_fp8_block_scaling = False
+        try:
+            caps.has_nvfp4 = te_pytorch.is_nvfp4_available()
+        except (AttributeError, Exception):
+            caps.has_nvfp4 = False
+
+        try:
+            caps.has_fp8_block_scaling = te_pytorch.is_fp8_block_scaling_available()
+        except (AttributeError, Exception):
+            caps.has_fp8_block_scaling = False
 
     # Match GPU spec from database
     for key, spec in GPU_SPECS.items():

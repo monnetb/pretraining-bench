@@ -118,6 +118,8 @@ def get_dataloader(
     num_workers: int = 2,
     distributed: bool = False,
     seed: int = 42,
+    dp_rank: Optional[int] = None,
+    dp_size: Optional[int] = None,
 ) -> DataLoader:
     """
     Factory function to create the appropriate DataLoader.
@@ -132,6 +134,9 @@ def get_dataloader(
         num_workers: DataLoader workers
         distributed: Whether to use DistributedSampler
         seed: Random seed for synthetic data
+        dp_rank: Data-parallel rank (for TP+DP; ensures TP ranks in the
+                 same group see the same data)
+        dp_size: Data-parallel world size (for TP+DP)
 
     Returns:
         Configured DataLoader
@@ -157,8 +162,21 @@ def get_dataloader(
     sampler = None
     shuffle = True
     if distributed:
-        sampler = DistributedSampler(dataset, shuffle=True, seed=seed)
+        # When using TP+DP, the sampler must shard data across DP groups only
+        # (not the full world), so that all TP ranks within a group see the same data.
+        sampler_kwargs = dict(shuffle=True, seed=seed)
+        if dp_rank is not None and dp_size is not None:
+            sampler_kwargs["num_replicas"] = dp_size
+            sampler_kwargs["rank"] = dp_rank
+        sampler = DistributedSampler(dataset, **sampler_kwargs)
         shuffle = False  # DistributedSampler handles shuffling
+
+    # Use a seeded generator for deterministic shuffle order.
+    # This is critical for tensor parallelism: all TP ranks must see
+    # the same data in the same order, so the DataLoader shuffle must
+    # be identical across processes in the same TP group.
+    generator = torch.Generator()
+    generator.manual_seed(seed)
 
     loader = DataLoader(
         dataset,
@@ -169,6 +187,7 @@ def get_dataloader(
         pin_memory=True,
         drop_last=True,
         persistent_workers=num_workers > 0,
+        generator=generator,
     )
 
     logger.info(

@@ -116,3 +116,48 @@ models:
     activation: swiglu
     bias: false
     max_seq_length: 2048
+
+  # --------------------------------------------------------------------------
+  # 8B — Llama 3 8B architecture (single H200 or multi-GPU)
+  # --------------------------------------------------------------------------
+  8b-llama:
+    arch_style: llama
+    hidden_size: 4096
+    num_attention_heads: 32
+    num_layers: 32
+    ffn_hidden_size: 14336
+    num_gqa_groups: 8
+    normalization: RMSNorm
+    activation: swiglu
+    bias: false
+    max_seq_length: 2048
+
+  # --------------------------------------------------------------------------
+  # 70B — Llama 3 70B architecture (requires tensor parallelism, not FSDP-only)
+  # --------------------------------------------------------------------------
+  70b-llama:
+    arch_style: llama
+    hidden_size: 8192
+    num_attention_heads: 64
+    num_layers: 80
+    ffn_hidden_size: 28672
+    num_gqa_groups: 8
+    normalization: RMSNorm
+    activation: swiglu
+    bias: false
+    max_seq_length: 2048
+
+  # --------------------------------------------------------------------------
+  # 30B — Largest model that fits 8×H200 with FSDP2 + activation checkpointing
+  # --------------------------------------------------------------------------
+  30b-llama:
+    arch_style: llama
+    hidden_size: 6144
+    num_attention_heads: 48
+    num_layers: 60
+    ffn_hidden_size: 21504
+    num_gqa_groups: 8
+    normalization: RMSNorm
+    activation: swiglu
+    bias: false
+    max_seq_length: 2048

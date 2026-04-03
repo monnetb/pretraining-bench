@@ -8,6 +8,9 @@ Supports two architecture families:
 
 The model is a standard decoder-only causal language model:
   Token Embedding → [Position Embedding] → N × TransformerLayer → Final Norm → LM Head
+
+Supports tensor parallelism via TransformerEngine's native TP support
+(tp_group, tp_size, set_parallel_mode) and vocab-parallel embedding/LM head.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 import transformer_engine.pytorch as te
 
@@ -75,6 +79,19 @@ def _count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def _count_total_parameters(model: nn.Module, tp_size: int = 1) -> int:
+    """
+    Count total model parameters accounting for tensor parallelism.
+
+    With TP, each rank holds 1/tp_size of the sharded parameters.
+    This function returns the total (unsharded) parameter count.
+    """
+    local_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # TE layers shard their weights across TP ranks, so multiply back
+    # Embedding and LM head are also sharded via VocabParallel
+    return local_params * tp_size
+
+
 def compute_flops_per_token(config: ModelConfig) -> int:
     """
     Compute the number of floating-point operations per token for a training step.
@@ -90,6 +107,7 @@ def compute_flops_per_token(config: ModelConfig) -> int:
       Training step = 3 × forward pass (forward + backward ≈ 3× forward)
 
     This gives a rough but standard estimate used industry-wide for MFU calculation.
+    Note: This is architecture-level, independent of parallelism strategy.
     """
     # Parameter-based flops (matrix multiplications in transformer layers)
     P = config.num_layers * (
@@ -120,16 +138,35 @@ class GPTModel(nn.Module):
       - Stack of te.TransformerLayer blocks
       - Final normalization
       - Linear language model head (weight-tied with token embedding)
+
+    Supports tensor parallelism via TE's native tp_group/tp_size parameters.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self,
+        config: ModelConfig,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        tp_size: int = 1,
+    ):
         super().__init__()
         self.config = config
+        self.tp_size = tp_size
+        self.tp_group = tp_group
+        self.use_tp = tp_size > 1
 
         # --- Embeddings ---
-        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        if self.use_tp:
+            from .distributed import VocabParallelEmbedding, ParallelLMHead
+            self.token_embedding = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size,
+                tp_group=tp_group, tp_size=tp_size,
+            )
+        else:
+            self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+
         self.use_learned_pos_emb = config.arch_style == "gpt2"
         if self.use_learned_pos_emb:
+            # Position embeddings are small — replicate across all TP ranks
             self.position_embedding = nn.Embedding(config.max_seq_length, config.hidden_size)
         self.embedding_dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
@@ -156,6 +193,15 @@ class GPTModel(nn.Module):
             if config.num_gqa_groups is not None:
                 layer_kwargs["num_gqa_groups"] = config.num_gqa_groups
 
+            # Tensor parallelism support — TE internally shards QKV (column-parallel)
+            # and output projection (row-parallel) when tp_group is set.
+            # set_parallel_mode=True enables the column/row parallel split.
+            if self.use_tp:
+                layer_kwargs["tp_group"] = tp_group
+                layer_kwargs["tp_size"] = tp_size
+                layer_kwargs["set_parallel_mode"] = True
+                layer_kwargs["sequence_parallel"] = False
+
             self.layers.append(te.TransformerLayer(**layer_kwargs))
 
         # --- Final Norm ---
@@ -164,24 +210,45 @@ class GPTModel(nn.Module):
         else:
             self.final_norm = te.LayerNorm(config.hidden_size)
 
-        # --- LM Head (tied with token embedding) ---
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # Tie weights
-        self.lm_head.weight = self.token_embedding.weight
+        # --- LM Head ---
+        if self.use_tp:
+            self.lm_head = ParallelLMHead(
+                config.hidden_size, config.vocab_size,
+                tp_group=tp_group, tp_size=tp_size, bias=False,
+            )
+            # Tie weights: each rank's LM head shard matches its embedding shard
+            self.lm_head.linear.weight = self.token_embedding.embedding.weight
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            # Tie weights
+            self.lm_head.weight = self.token_embedding.weight
 
         # Initialize weights
         self._init_weights()
 
+        # Parameter counting
         num_params = _count_parameters(self)
-        logger.info(
-            f"Model '{config.name}': {num_params:,} parameters "
-            f"({num_params / 1e6:.1f}M)"
-        )
+        if self.use_tp:
+            # With TP, TE layers shard weights. Approximate total from config.
+            total_params = config.num_params_approx
+            logger.info(
+                f"Model '{config.name}': ~{total_params:,} total parameters "
+                f"({total_params / 1e6:.1f}M), {num_params:,} per TP rank "
+                f"(tp_size={tp_size})"
+            )
+        else:
+            logger.info(
+                f"Model '{config.name}': {num_params:,} parameters "
+                f"({num_params / 1e6:.1f}M)"
+            )
 
     def _init_weights(self):
         """Initialize embeddings with standard normal scaled by hidden_size."""
         std = 0.02
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
+        if self.use_tp:
+            nn.init.normal_(self.token_embedding.embedding.weight, mean=0.0, std=std)
+        else:
+            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
         if self.use_learned_pos_emb:
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=std)
 
@@ -216,30 +283,48 @@ class GPTModel(nn.Module):
         x = x.to(dtype=torch.bfloat16)
 
         # Transformer layers
-        for layer in self.layers:
-            x = layer(x, attention_mask=attention_mask)
+        use_ac = getattr(self, "_use_activation_checkpointing", False)
+        if use_ac:
+            from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
+            for layer in self.layers:
+                x = te_checkpoint(
+                    layer,
+                    x,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+        else:
+            for layer in self.layers:
+                x = layer(x, attention_mask=attention_mask)
 
         # Final norm
         x = self.final_norm(x)
 
         # LM head
-        logits = self.lm_head(x.float())  # cast back to FP32 for loss computation
+        logits = self.lm_head(x).float()  # cast to FP32 after projection for loss computation
 
         return logits
 
 
-def build_model(config: ModelConfig, device: torch.device = torch.device("cuda")) -> GPTModel:
+def build_model(
+    config: ModelConfig,
+    device: torch.device = torch.device("cuda"),
+    tp_group: Optional[dist.ProcessGroup] = None,
+    tp_size: int = 1,
+) -> GPTModel:
     """
     Build and return a GPTModel on the specified device.
 
     Args:
         config: Model configuration
         device: Target device
+        tp_group: Tensor parallel process group (None for no TP)
+        tp_size: Tensor parallel size
 
     Returns:
         GPTModel instance on device
     """
-    model = GPTModel(config)
+    model = GPTModel(config, tp_group=tp_group, tp_size=tp_size)
     model = model.to(device)
     return model
 

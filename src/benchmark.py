@@ -2,8 +2,9 @@
 Main entry point for the transformer pretraining GPU benchmark.
 
 Orchestrates model creation, dataset loading, training, and reporting.
-Supports single-GPU and multi-GPU (FSDP2) modes, multiple precision
-modes (BF16, FP8, MXFP8, NVFP4), and sweeps across configurations.
+Supports single-GPU and multi-GPU (FSDP2) modes, tensor parallelism,
+multiple precision modes (BF16, FP8, MXFP8, NVFP4), and sweeps across
+configurations.
 
 Usage:
     # Single GPU, single config
@@ -17,6 +18,12 @@ Usage:
 
     # Multi-GPU with FSDP2
     torchrun --nproc_per_node=8 -m src.benchmark --model-size large-llama --precision auto
+
+    # Multi-GPU with Tensor Parallelism (TP=8, no DP)
+    torchrun --nproc_per_node=8 -m src.benchmark --model-size 70b-llama --tp-size 8
+
+    # 2D parallelism: TP=4, DP=2
+    torchrun --nproc_per_node=8 -m src.benchmark --model-size 70b-llama --tp-size 4
 """
 
 from __future__ import annotations
@@ -55,7 +62,8 @@ def parse_args() -> argparse.Namespace:
             "Model config name from model_configs.yaml. "
             "Use 'all' to run all models, or specify comma-separated names. "
             "Available: small-gpt2, small-llama, medium-gpt2, medium-llama, "
-            "large-gpt2, large-llama, xlarge-gpt2, xlarge-llama"
+            "large-gpt2, large-llama, xlarge-gpt2, xlarge-llama, 8b-llama, "
+            "30b-llama, 70b-llama"
         ),
     )
 
@@ -112,6 +120,17 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument(
         "--max-grad-norm", type=float, default=1.0,
         help="Gradient clipping max norm (0 to disable)",
+    )
+
+    # Parallelism
+    par_group = parser.add_argument_group("Parallelism")
+    par_group.add_argument(
+        "--tp-size", type=int, default=1,
+        help=(
+            "Tensor parallelism size. Must divide world_size evenly. "
+            "dp_size = world_size / tp_size. Use tp_size > 1 for models "
+            "that don't fit with FSDP-only (e.g., 70b-llama)."
+        ),
     )
 
     # Optimization
@@ -187,6 +206,7 @@ def run_single_benchmark(
     gpu_caps,
     rank: int,
     world_size: int,
+    parallel_groups=None,
 ):
     """
     Run a single benchmark configuration.
@@ -195,7 +215,7 @@ def run_single_benchmark(
     """
     import torch
 
-    from .model import load_model_config, build_model, compute_flops_per_token, _count_parameters
+    from .model import load_model_config, build_model, compute_flops_per_token
     from .data import get_dataloader
     from .metrics import BenchmarkMetrics, BenchmarkResult, reset_memory_stats
     from .precision import PrecisionMode, get_available_precisions
@@ -204,6 +224,8 @@ def run_single_benchmark(
     from .report import print_single_result
 
     precision_mode = PrecisionMode(precision_mode_str)
+    tp_size = args.tp_size if parallel_groups is not None else 1
+    dp_size = world_size // tp_size
 
     # Check if precision mode is available
     available = get_available_precisions(gpu_caps)
@@ -217,7 +239,8 @@ def run_single_benchmark(
 
     if is_main_process():
         logger.info(f"\n{'=' * 60}")
-        logger.info(f"  Benchmark: {model_name} | {precision_mode}")
+        tp_info = f" | TP={tp_size}" if tp_size > 1 else ""
+        logger.info(f"  Benchmark: {model_name} | {precision_mode}{tp_info}")
         logger.info(f"{'=' * 60}")
 
     # Load model config
@@ -228,28 +251,35 @@ def run_single_benchmark(
     # Override seq_length from CLI if specified
     model_config.max_seq_length = args.seq_length
 
-    # Build model
+    # Build model with TP support
     device = torch.device("cuda")
-    model = build_model(model_config, device=device)
-    num_params = _count_parameters(model)
+    tp_group = parallel_groups.tp_group if parallel_groups else None
+    model = build_model(model_config, device=device, tp_group=tp_group, tp_size=tp_size)
+
+    # Get parameter counts — use config-level count for total (architecture-level, independent of TP)
+    num_params = model_config.num_params_approx
     flops_per_token = compute_flops_per_token(model_config)
 
-    # Apply FSDP2 for multi-GPU
-    if world_size > 1:
-        model = apply_fsdp2(model)
+    # Apply FSDP2 for data parallelism (when dp_size > 1)
+    if dp_size > 1:
+        dp_group = parallel_groups.dp_group if parallel_groups else None
+        model = apply_fsdp2(model, dp_group=dp_group)
 
     # Activation checkpointing
     if args.activation_checkpointing:
         apply_activation_checkpointing(model)
 
-    # Create dataloader
+    # Create dataloader — distributed sampler uses DP group, not full world
+    dp_rank = parallel_groups.dp_rank if parallel_groups else None
     dataloader = get_dataloader(
         dataset_type=args.dataset,
         seq_length=args.seq_length,
         batch_size=args.batch_size,
         num_samples=args.num_samples,
         text_path=args.text_path,
-        distributed=(world_size > 1),
+        distributed=(dp_size > 1),
+        dp_rank=dp_rank if dp_size > 1 else None,
+        dp_size=dp_size if dp_size > 1 else None,
     )
 
     # Create metrics collector
@@ -266,6 +296,7 @@ def run_single_benchmark(
         arch_style=model_config.arch_style,
         activation_checkpointing=args.activation_checkpointing,
         torch_compile=args.use_compile,
+        tp_size=tp_size,
     )
 
     # Create trainer and run
@@ -312,7 +343,10 @@ def main():
     import yaml
 
     # --- Distributed setup ---
-    from .distributed import setup_distributed, cleanup_distributed, is_main_process, barrier
+    from .distributed import (
+        setup_distributed, cleanup_distributed, is_main_process, barrier,
+        setup_parallel_groups,
+    )
 
     rank, world_size, local_rank = setup_distributed()
 
@@ -322,6 +356,31 @@ def main():
         logger.info("=" * 60)
 
     try:
+        # --- Validate TP size ---
+        tp_size = args.tp_size
+        if tp_size > 1:
+            if world_size % tp_size != 0:
+                logger.error(
+                    f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+                )
+                sys.exit(1)
+            if world_size < tp_size:
+                logger.error(
+                    f"tp_size ({tp_size}) cannot exceed world_size ({world_size})"
+                )
+                sys.exit(1)
+
+        # --- Setup parallel groups (TP + DP) ---
+        parallel_groups = None
+        if world_size > 1 and tp_size > 1:
+            parallel_groups = setup_parallel_groups(world_size, tp_size)
+            if is_main_process():
+                dp_size = world_size // tp_size
+                logger.info(f"Parallelism: TP={tp_size} × DP={dp_size}")
+        elif world_size > 1:
+            # Pure FSDP mode — create trivial parallel groups for consistency
+            parallel_groups = setup_parallel_groups(world_size, tp_size=1)
+
         # --- GPU detection ---
         from .precision import (
             detect_gpu_capabilities,
@@ -377,6 +436,8 @@ def main():
         if is_main_process():
             logger.info(f"Models:     {model_names}")
             logger.info(f"Precisions: {precision_modes}")
+            if tp_size > 1:
+                logger.info(f"TP size:    {tp_size}")
             logger.info(f"Total runs: {total_runs}")
 
         # --- Run benchmarks ---
@@ -405,6 +466,7 @@ def main():
                         gpu_caps=gpu_caps,
                         rank=rank,
                         world_size=world_size,
+                        parallel_groups=parallel_groups,
                     )
                     if result is not None:
                         all_results.append(result)

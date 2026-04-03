@@ -44,6 +44,7 @@ CSV_COLUMNS = [
     "final_loss",
     "activation_checkpointing",
     "torch_compile",
+    "tp_size",
 ]
 
 
@@ -75,7 +76,8 @@ def print_summary_table(
 
     # Print GPU info from first result
     r0 = results[0]
-    print(f"  GPU: {r0.gpu_name} × {r0.num_gpus}")
+    tp_info = f" (TP={r0.tp_size})" if r0.tp_size > 1 else ""
+    print(f"  GPU: {r0.gpu_name} × {r0.num_gpus}{tp_info}")
     print(f"{'─' * 80}")
 
     headers = [
@@ -210,7 +212,8 @@ def print_single_result(result: BenchmarkResult) -> None:
     print(f"\n{'─' * 60}")
     print(f"  {result.model_name} | {result.precision_mode}")
     print(f"{'─' * 60}")
-    print(f"  GPU:            {result.gpu_name} × {result.num_gpus}")
+    tp_info = f" (TP={result.tp_size})" if result.tp_size > 1 else ""
+    print(f"  GPU:            {result.gpu_name} × {result.num_gpus}{tp_info}")
     print(f"  Parameters:     {result.num_params:,}")
     print(f"  Batch × Seq:    {result.batch_size} × {result.seq_length}")
     print(f"  ──────────────────────────────────────────")

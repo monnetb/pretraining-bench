@@ -67,6 +67,7 @@ class BenchmarkResult:
     total_steps: int = 0
     warmup_steps: int = 0
     flops_per_token: int = 0
+    tp_size: int = 1
 
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dictionary."""
@@ -94,6 +95,7 @@ class BenchmarkResult:
             "total_steps": self.total_steps,
             "warmup_steps": self.warmup_steps,
             "flops_per_token": self.flops_per_token,
+            "tp_size": self.tp_size,
         }
 
 
@@ -124,6 +126,7 @@ class BenchmarkMetrics:
         arch_style: str = "",
         activation_checkpointing: bool = False,
         torch_compile: bool = False,
+        tp_size: int = 1,
     ):
         self.model_name = model_name
         self.precision_mode = precision_mode
@@ -137,6 +140,8 @@ class BenchmarkMetrics:
         self.arch_style = arch_style
         self.activation_checkpointing = activation_checkpointing
         self.torch_compile = torch_compile
+        self.tp_size = tp_size
+        self.log_interval = 50  # log every N measured steps
 
         self._records: list[StepRecord] = []
         self._step_start_events: dict[int, torch.cuda.Event] = {}
@@ -179,16 +184,21 @@ class BenchmarkMetrics:
         )
         self._records.append(record)
 
-        # Log progress
-        if not is_warmup:
-            tokens_per_sec = tokens / (elapsed_ms / 1000.0)
-            logger.info(
-                f"  Step {step:4d} | loss={loss:.4f} | "
-                f"time={elapsed_ms:.1f}ms | "
-                f"tok/s={tokens_per_sec:,.0f}"
-            )
+        # Log progress (only at intervals to reduce verbosity)
+        if is_warmup:
+            if step == 0 or step == self.warmup_steps - 1:
+                logger.info(f"  Step {step:4d} | loss={loss:.4f} | WARMUP")
         else:
-            logger.info(f"  Step {step:4d} | loss={loss:.4f} | WARMUP")
+            measured_step = step - self.warmup_steps
+            is_first = (measured_step == 0)
+            is_interval = (measured_step % self.log_interval == 0)
+            if is_first or is_interval:
+                tokens_per_sec = tokens / (elapsed_ms / 1000.0)
+                logger.info(
+                    f"  Step {step:4d} | loss={loss:.4f} | "
+                    f"time={elapsed_ms:.1f}ms | "
+                    f"tok/s={tokens_per_sec:,.0f}"
+                )
 
     def get_result(self) -> BenchmarkResult:
         """
@@ -205,18 +215,20 @@ class BenchmarkMetrics:
         total_tokens = sum(r.tokens for r in measured)
         total_time_s = sum(r.wall_time_ms for r in measured) / 1000.0
 
-        # Throughput
-        tokens_per_second = total_tokens / total_time_s
+        # Throughput (aggregate across all data-parallel ranks)
+        # With TP, all TP ranks process the same tokens — don't multiply by tp_size
+        dp_size = self.num_gpus // self.tp_size
+        tokens_per_second = (total_tokens / total_time_s) * dp_size
 
-        # TFLOPS achieved
-        # flops_per_token already includes the 3× for training (fwd + bwd)
+        # TFLOPS achieved (aggregate)
+        # flops_per_token already includes the 3x for training (fwd + bwd)
         achieved_flops_per_sec = self.flops_per_token * tokens_per_second
         achieved_tflops = achieved_flops_per_sec / 1e12
 
-        # MFU: fraction of theoretical peak we're achieving (per GPU)
+        # MFU: fraction of theoretical peak (aggregate achieved / aggregate peak)
         peak_tflops = get_peak_tflops(self.gpu_caps, self.precision_mode)
-        # achieved_tflops is total across all GPUs, peak is per GPU
-        mfu = achieved_tflops / (peak_tflops * self.num_gpus) if peak_tflops > 0 else 0.0
+        total_peak_tflops = peak_tflops * self.num_gpus
+        mfu = achieved_tflops / total_peak_tflops if total_peak_tflops > 0 else 0.0
 
         # Peak memory
         peak_memory_bytes = torch.cuda.max_memory_allocated()
@@ -254,6 +266,7 @@ class BenchmarkMetrics:
             total_steps=len(self._records),
             warmup_steps=self.warmup_steps,
             flops_per_token=self.flops_per_token,
+            tp_size=self.tp_size,
         )
 
 
