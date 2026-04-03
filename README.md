@@ -9,10 +9,10 @@ with multiple precision modes and model configurations.
 ## Features
 
 - **Multi-architecture models**: GPT-2 style (LayerNorm/GELU/MHA) and LLaMA style (RMSNorm/SwiGLU/GQA)
-- **Multiple model sizes**: 125M, 350M, 760M, 1.3B parameters
+- **Multiple model sizes**: 125M, 350M, 760M, 1.3B, 8B, 30B, 70B parameters
 - **Auto-detected precision modes**: BF16, FP8 (Delayed/Current/Block scaling), MXFP8, NVFP4
 - **Performance metrics**: Tokens/s, TFLOPS, MFU, peak memory, step time statistics
-- **Multi-GPU support**: FSDP2 with torchrun
+- **Multi-GPU support**: FSDP2 with torchrun, tensor parallelism (TP) for large models, hybrid TP×DP 2D parallelism
 - **Sweep mode**: Automatically benchmarks all model × precision combinations
 - **Structured output**: JSON and CSV results for cross-GPU comparison
 
@@ -35,6 +35,12 @@ with multiple precision modes and model configurations.
 
 # Multi-GPU with FSDP2 (8 GPUs)
 ./scripts/run_multi_gpu.sh 8 large-llama auto
+
+# 70B model with tensor parallelism (TP=8)
+./scripts/run_multi_gpu.sh 8 70b-llama auto 1 2048 20 5 8
+
+# 8B model with 2D parallelism (TP=2, DP=4)
+./scripts/run_multi_gpu.sh 8 8b-llama auto 8 2048 100 10 2
 ```
 
 ## Direct Python Usage
@@ -51,6 +57,12 @@ python -m src.benchmark --sweep
 
 # Multi-GPU
 torchrun --nproc_per_node=8 -m src.benchmark --model-size large-llama --precision auto
+
+# 70B with tensor parallelism (TP=8, no FSDP)
+torchrun --nproc_per_node=8 -m src.benchmark --model-size 70b-llama --precision bf16 --tp-size 8
+
+# 2D parallelism: TP=4 × DP=2
+torchrun --nproc_per_node=8 -m src.benchmark --model-size 70b-llama --precision bf16 --tp-size 4
 ```
 
 ## CLI Options
@@ -67,6 +79,7 @@ torchrun --nproc_per_node=8 -m src.benchmark --model-size large-llama --precisio
 | `--text-path` | - | Text file path for `tiny-text` dataset |
 | `--activation-checkpointing` | off | Enable gradient checkpointing |
 | `--use-compile` | off | Apply `torch.compile` |
+| `--tp-size` | `1` | Tensor parallel size (must divide world_size; dp_size = world_size / tp_size) |
 | `--sweep` | off | Run all model × precision combinations |
 | `--output-dir` | `results` | Results output directory |
 
@@ -82,6 +95,9 @@ torchrun --nproc_per_node=8 -m src.benchmark --model-size large-llama --precisio
 | `large-llama` | ~760M | 1536 | 16 | 24 | 6144 | LLaMA |
 | `xlarge-gpt2` | ~1.3B | 2048 | 32 | 24 | 8192 | GPT-2 |
 | `xlarge-llama` | ~1.3B | 2048 | 32 | 24 | 8192 | LLaMA |
+| `8b-llama` | ~8B | 4096 | 32 | 32 | 14336 | LLaMA 3 |
+| `30b-llama` | ~30B | 6144 | 48 | 60 | 21504 | LLaMA |
+| `70b-llama` | ~70B | 8192 | 64 | 80 | 28672 | LLaMA 3 |
 
 ## Precision Modes
 
@@ -93,6 +109,35 @@ torchrun --nproc_per_node=8 -m src.benchmark --model-size large-llama --precisio
 | `fp8-block` | Hopper+ (SM90) | FP8 with per-block scaling |
 | `mxfp8` | Blackwell (SM100) | Microscaling FP8 (MX format) |
 | `nvfp4` | Blackwell (SM100) | FP4 with NVIDIA block scaling |
+
+## Tensor Parallelism
+
+Large models (8B, 30B, 70B) require tensor parallelism (TP) to fit across
+multiple GPUs. TP shards the model weights (attention QKV/output projections,
+FFN, embeddings, and LM head) across GPUs within a TP group, while FSDP2
+handles data parallelism (DP) across TP groups.
+
+| Layout | `--tp-size` | DP size | Example |
+|--------|-------------|---------|---------|
+| Pure FSDP | 1 (default) | world_size | `torchrun --nproc_per_node=8 -m src.benchmark --model-size xlarge-llama` |
+| Pure TP | world_size | 1 | `torchrun --nproc_per_node=8 -m src.benchmark --model-size 70b-llama --tp-size 8` |
+| 2D (TP×DP) | 2–N | world_size/tp_size | `torchrun --nproc_per_node=8 -m src.benchmark --model-size 8b-llama --tp-size 2` |
+
+With 8 GPUs and `--tp-size 4`:
+- **TP groups** (share model weights): [0,1,2,3], [4,5,6,7]
+- **DP groups** (share data batches): [0,4], [1,5], [2,6], [3,7]
+
+**Implementation details:**
+- `VocabParallelEmbedding`: shards the embedding table along the vocabulary dimension across TP ranks; uses all-reduce to combine partial lookups
+- `ParallelLMHead`: column-parallel linear layer with all-gather to reconstruct full logits
+- TransformerEngine layers use native `tp_group`/`tp_size`/`set_parallel_mode` for column- and row-parallel sharding of attention and FFN weights
+- FSDP2 uses a `DeviceMesh` restricted to the DP sub-group so it only shards across data-parallel ranks
+- `DataLoader` seeding is deterministic per TP group to ensure all TP ranks see the same data
+
+**Verified configurations (8×H200):**
+- 70B with TP=8: fits in ~131 GB/GPU
+- 8B with TP=2 + DP=4: correct 2D parallelism
+- All existing FSDP-only configs (≤1.3B) remain unaffected
 
 ## MFU Calculation
 
@@ -143,7 +188,7 @@ transformer-bench/
 │   ├── trainer.py              # Training loop
 │   ├── metrics.py              # Throughput, MFU, memory
 │   ├── precision.py            # GPU detection + recipes
-│   ├── distributed.py          # FSDP2 setup
+│   ├── distributed.py          # FSDP2 + tensor parallelism setup
 │   └── report.py               # Console table, JSON, CSV
 ├── scripts/
 │   ├── setup_venv.sh              # Create venv and install deps
