@@ -11,6 +11,10 @@ The model is a standard decoder-only causal language model:
 
 Supports tensor parallelism via TransformerEngine's native TP support
 (tp_group, tp_size, set_parallel_mode) and vocab-parallel embedding/LM head.
+
+When --no-te is passed, a pure-PyTorch fallback model (PureTorchGPTModel) is
+used instead.  It requires only standard PyTorch ops (nn.RMSNorm available
+since PyTorch 2.4) and works on any GPU without TE kernel support.
 """
 
 from __future__ import annotations
@@ -147,12 +151,14 @@ class GPTModel(nn.Module):
         config: ModelConfig,
         tp_group: Optional[dist.ProcessGroup] = None,
         tp_size: int = 1,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
         self.tp_size = tp_size
         self.tp_group = tp_group
         self.use_tp = tp_size > 1
+        self.sequence_parallel = sequence_parallel and self.use_tp
 
         # --- Embeddings ---
         if self.use_tp:
@@ -200,7 +206,7 @@ class GPTModel(nn.Module):
                 layer_kwargs["tp_group"] = tp_group
                 layer_kwargs["tp_size"] = tp_size
                 layer_kwargs["set_parallel_mode"] = True
-                layer_kwargs["sequence_parallel"] = False
+                layer_kwargs["sequence_parallel"] = self.sequence_parallel
 
             self.layers.append(te.TransformerLayer(**layer_kwargs))
 
@@ -300,10 +306,320 @@ class GPTModel(nn.Module):
         # Final norm
         x = self.final_norm(x)
 
-        # LM head
-        logits = self.lm_head(x).float()  # cast to FP32 after projection for loss computation
+        # LM head — keep in BF16; F.cross_entropy upscales internally as needed.
+        # Avoiding the .float() cast saves ~vocab_size * batch * seq * 2 bytes
+        # (e.g., 0.8 GB for batch=4, seq=2048, vocab=50257), enabling larger batches.
+        logits = self.lm_head(x)
 
         return logits
+
+    def forward_with_loss(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        loss_chunk_size: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with integrated loss computation.
+
+        When loss_chunk_size > 0, computes cross-entropy in chunks along the
+        sequence dimension to avoid materializing the full (B*S, vocab) logit
+        tensor.  This saves ~vocab_size * chunk_saved * 2 bytes of peak memory,
+        enabling larger batch sizes and thus higher MFU.
+
+        Args:
+            input_ids: (batch_size, seq_length)
+            targets: (batch_size, seq_length)
+            attention_mask: optional
+            loss_chunk_size: if > 0, chunk cross-entropy computation
+
+        Returns:
+            (loss, logits_for_last_chunk_or_none)
+        """
+        B, S = input_ids.shape
+        x = self.token_embedding(input_ids)
+        if self.use_learned_pos_emb:
+            positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
+            x = x + self.position_embedding(positions).unsqueeze(0)
+        x = self.embedding_dropout(x)
+        x = x.to(dtype=torch.bfloat16)
+
+        use_ac = getattr(self, "_use_activation_checkpointing", False)
+        if use_ac:
+            from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
+            for layer in self.layers:
+                x = te_checkpoint(layer, x, attention_mask, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                x = layer(x, attention_mask=attention_mask)
+
+        x = self.final_norm(x)
+
+        if loss_chunk_size > 0 and S > loss_chunk_size:
+            # Chunked cross-entropy: compute loss in segments to avoid
+            # materializing the full (B*S, vocab) logit tensor in memory.
+            total_loss = torch.tensor(0.0, device=x.device)
+            total_tokens = 0
+            for start in range(0, S, loss_chunk_size):
+                end = min(start + loss_chunk_size, S)
+                chunk_x = x[:, start:end, :]           # (B, chunk, H)
+                chunk_targets = targets[:, start:end]   # (B, chunk)
+                chunk_logits = self.lm_head(chunk_x)    # (B, chunk, V)
+                chunk_loss = F.cross_entropy(
+                    chunk_logits.float().reshape(-1, chunk_logits.size(-1)),
+                    chunk_targets.reshape(-1),
+                    reduction="sum",
+                )
+                total_loss = total_loss + chunk_loss
+                total_tokens += chunk_targets.numel()
+                del chunk_logits  # free immediately
+            loss = total_loss / total_tokens
+            return loss, None
+        else:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+            )
+            return loss, logits
+
+
+# ===========================================================================
+#  Pure-PyTorch fallback model (no TransformerEngine dependency at runtime)
+# ===========================================================================
+
+class _SwiGLU(nn.Module):
+    """SwiGLU activation: SiLU(gate) * up."""
+
+    def __init__(self, hidden_size: int, ffn_hidden_size: int, bias: bool = False):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, ffn_hidden_size, bias=bias)
+        self.up_proj = nn.Linear(hidden_size, ffn_hidden_size, bias=bias)
+        self.down_proj = nn.Linear(ffn_hidden_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _GELUMLP(nn.Module):
+    """Standard GELU MLP (GPT-2 style)."""
+
+    def __init__(self, hidden_size: int, ffn_hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_size, ffn_hidden_size, bias=bias)
+        self.fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+
+
+class _PureTorchTransformerBlock(nn.Module):
+    """
+    Single decoder-only transformer block using only PyTorch primitives.
+
+    Uses torch.nn.functional.scaled_dot_product_attention for flash/memory-
+    efficient attention (available since PyTorch 2.0).
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.num_kv_heads = config.num_gqa_groups or config.num_attention_heads
+        self.kv_head_dim = self.num_kv_heads * self.head_dim
+
+        # Pre-attention norm
+        if config.normalization == "RMSNorm":
+            self.norm1 = nn.RMSNorm(config.hidden_size)
+        else:
+            self.norm1 = nn.LayerNorm(config.hidden_size)
+
+        # QKV projections (separate for GQA support)
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.kv_head_dim, bias=config.bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.kv_head_dim, bias=config.bias)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.bias)
+
+        # Pre-FFN norm
+        if config.normalization == "RMSNorm":
+            self.norm2 = nn.RMSNorm(config.hidden_size)
+        else:
+            self.norm2 = nn.LayerNorm(config.hidden_size)
+
+        # FFN
+        if config.activation == "swiglu":
+            self.ffn = _SwiGLU(config.hidden_size, config.ffn_hidden_size, bias=config.bias)
+        else:
+            self.ffn = _GELUMLP(config.hidden_size, config.ffn_hidden_size, bias=config.bias)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, S, H = x.shape
+        # Pre-norm + attention
+        h = self.norm1(x)
+        q = self.q_proj(h).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # GQA: expand KV heads to match Q heads
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+
+        # Flash / memory-efficient attention (PyTorch 2.0+)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, -1)
+        x = x + self.o_proj(attn_out)
+
+        # Pre-norm + FFN
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class PureTorchGPTModel(nn.Module):
+    """
+    Decoder-only transformer using **only** PyTorch primitives.
+
+    This model is functionally equivalent to GPTModel but does not depend on
+    TransformerEngine CUDA kernels.  Use it with ``--no-te`` on GPUs where
+    TE's custom kernels are not yet supported (e.g., B300 SXM6 AC at CC 10.3).
+
+    Limitations vs GPTModel:
+      - No FP8/MXFP8/NVFP4 support (BF16 only)
+      - No tensor-parallelism (single-GPU or FSDP only)
+      - No sequence parallelism
+      - Rotary embeddings are NOT applied (LLaMA models use learned pos emb)
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.tp_size = 1
+
+        # Embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        # Always use learned position embeddings in the pure-torch path
+        self.position_embedding = nn.Embedding(config.max_seq_length, config.hidden_size)
+        self.embedding_dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            _PureTorchTransformerBlock(config) for _ in range(config.num_layers)
+        ])
+
+        # Final norm
+        if config.normalization == "RMSNorm":
+            self.final_norm = nn.RMSNorm(config.hidden_size)
+        else:
+            self.final_norm = nn.LayerNorm(config.hidden_size)
+
+        # LM head (weight-tied with token embedding)
+        # Both stay in FP32 for stable embedding lookup; the forward pass
+        # casts x to BF16 after the lookup and casts back before the LM head.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight
+
+        # Initialize weights
+        std = 0.02
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=std)
+
+        # Cast transformer layers and final norm to BF16 (matching TE's params_dtype)
+        # Embeddings stay FP32 — the forward pass casts to BF16 after lookup.
+        for layer in self.layers:
+            layer.to(dtype=torch.bfloat16)
+        self.final_norm.to(dtype=torch.bfloat16)
+
+        num_params = _count_parameters(self)
+        logger.info(
+            f"PureTorchGPTModel '{config.name}': {num_params:,} parameters "
+            f"({num_params / 1e6:.1f}M) [no TE]"
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, S = input_ids.shape
+        x = self.token_embedding(input_ids)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
+        x = x + self.position_embedding(positions).unsqueeze(0)
+        x = self.embedding_dropout(x)
+        x = x.to(dtype=torch.bfloat16)
+
+        use_ac = getattr(self, "_use_activation_checkpointing", False)
+        if use_ac:
+            from torch.utils.checkpoint import checkpoint
+            for layer in self.layers:
+                x = checkpoint(layer, x, attention_mask, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                x = layer(x, attention_mask=attention_mask)
+
+        x = self.final_norm(x)
+        # Cast to match LM head weight dtype (FP32 — tied with embedding)
+        logits = self.lm_head(x.to(self.lm_head.weight.dtype))
+        return logits
+
+    def forward_with_loss(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        loss_chunk_size: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, S = input_ids.shape
+        x = self.token_embedding(input_ids)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
+        x = x + self.position_embedding(positions).unsqueeze(0)
+        x = self.embedding_dropout(x)
+        x = x.to(dtype=torch.bfloat16)
+
+        use_ac = getattr(self, "_use_activation_checkpointing", False)
+        if use_ac:
+            from torch.utils.checkpoint import checkpoint
+            for layer in self.layers:
+                x = checkpoint(layer, x, attention_mask, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                x = layer(x, attention_mask=attention_mask)
+
+        x = self.final_norm(x)
+
+        # Cast to match LM head weight dtype (FP32 — tied with embedding)
+        lm_dtype = self.lm_head.weight.dtype
+
+        if loss_chunk_size > 0 and S > loss_chunk_size:
+            total_loss = torch.tensor(0.0, device=x.device)
+            total_tokens = 0
+            for start in range(0, S, loss_chunk_size):
+                end = min(start + loss_chunk_size, S)
+                chunk_x = x[:, start:end, :]
+                chunk_targets = targets[:, start:end]
+                chunk_logits = self.lm_head(chunk_x.to(lm_dtype))
+                chunk_loss = F.cross_entropy(
+                    chunk_logits.float().reshape(-1, chunk_logits.size(-1)),
+                    chunk_targets.reshape(-1),
+                    reduction="sum",
+                )
+                total_loss = total_loss + chunk_loss
+                total_tokens += chunk_targets.numel()
+                del chunk_logits
+            loss = total_loss / total_tokens
+            return loss, None
+        else:
+            logits = self.lm_head(x.to(lm_dtype))
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+            )
+            return loss, logits
+
+
+# ===========================================================================
 
 
 def build_model(
@@ -311,7 +627,9 @@ def build_model(
     device: torch.device = torch.device("cuda"),
     tp_group: Optional[dist.ProcessGroup] = None,
     tp_size: int = 1,
-) -> GPTModel:
+    sequence_parallel: bool = False,
+    use_te: bool = True,
+) -> nn.Module:
     """
     Build and return a GPTModel on the specified device.
 
@@ -320,11 +638,19 @@ def build_model(
         device: Target device
         tp_group: Tensor parallel process group (None for no TP)
         tp_size: Tensor parallel size
+        sequence_parallel: Enable sequence parallelism (requires TP)
+        use_te: If True (default), use TransformerEngine layers.
+                If False, use pure-PyTorch fallback (BF16 only, no TP).
 
     Returns:
-        GPTModel instance on device
+        GPTModel or PureTorchGPTModel instance on device
     """
-    model = GPTModel(config, tp_group=tp_group, tp_size=tp_size)
+    if use_te:
+        model = GPTModel(config, tp_group=tp_group, tp_size=tp_size, sequence_parallel=sequence_parallel)
+    else:
+        if tp_size > 1:
+            logger.warning("Pure-PyTorch model does not support tensor parallelism; ignoring tp_size.")
+        model = PureTorchGPTModel(config)
     model = model.to(device)
     return model
 

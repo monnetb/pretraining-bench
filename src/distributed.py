@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,16 +24,47 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+def _setenv_if_unset(key: str, value: str) -> None:
+    """Set an environment variable only if it is not already set."""
+    if key not in os.environ:
+        os.environ[key] = value
+
+
+def configure_nccl_env() -> None:
+    """
+    Auto-configure NCCL environment variables based on the host platform.
+
+    For aarch64 systems (Grace Hopper GH200, Grace Blackwell GB300):
+      - Disables InfiniBand (uses NVLink for inter-GPU communication)
+      - Enables Multi-Node NVLink if available
+
+    All settings use set-if-unset semantics: user-set env vars always take
+    precedence. Call this BEFORE dist.init_process_group().
+    """
+    arch = platform.machine()
+    if arch == "aarch64":
+        _setenv_if_unset("NCCL_IB_DISABLE", "1")
+        _setenv_if_unset("NCCL_MNNVL_ENABLE", "1")
+        logger.info(
+            f"aarch64 detected: NCCL_IB_DISABLE={os.environ.get('NCCL_IB_DISABLE')}, "
+            f"NCCL_MNNVL_ENABLE={os.environ.get('NCCL_MNNVL_ENABLE')}"
+        )
+
+
 def setup_distributed() -> tuple[int, int, int]:
     """
     Initialize distributed process group.
 
     Expects torchrun environment variables (RANK, WORLD_SIZE, LOCAL_RANK).
+    Auto-configures NCCL environment for the host platform.
 
     Returns:
         (rank, world_size, local_rank)
     """
     if not dist.is_initialized():
+        # Configure NCCL before init_process_group
+        configure_nccl_env()
+
         # torchrun sets these environment variables
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -294,7 +326,6 @@ def apply_fsdp2(
     """
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 
-    import transformer_engine.pytorch as te
 
     mp_policy = MixedPrecisionPolicy(
         param_dtype=mixed_precision_dtype,

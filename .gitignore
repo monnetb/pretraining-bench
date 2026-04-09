@@ -23,3 +23,6 @@ results/
 *.swo
 *~
 .DS_Store
+.venv-*
+slurm*.out
+*.lock

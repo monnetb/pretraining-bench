@@ -8,7 +8,6 @@ Tracks per-step timing, throughput, memory, and computes MFU
 from __future__ import annotations
 
 import logging
-import math
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -64,6 +63,10 @@ class BenchmarkResult:
     arch_style: str = ""
     activation_checkpointing: bool = False
     torch_compile: bool = False
+    compile_mode: str = ""
+    fused_attn: bool = True
+    sequence_parallel: bool = False
+    gradient_accumulation_steps: int = 1
     total_steps: int = 0
     warmup_steps: int = 0
     flops_per_token: int = 0
@@ -92,6 +95,10 @@ class BenchmarkResult:
             "final_loss": round(self.final_loss, 4) if self.final_loss is not None else None,
             "activation_checkpointing": self.activation_checkpointing,
             "torch_compile": self.torch_compile,
+            "compile_mode": self.compile_mode,
+            "fused_attn": self.fused_attn,
+            "sequence_parallel": self.sequence_parallel,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "total_steps": self.total_steps,
             "warmup_steps": self.warmup_steps,
             "flops_per_token": self.flops_per_token,
@@ -126,6 +133,10 @@ class BenchmarkMetrics:
         arch_style: str = "",
         activation_checkpointing: bool = False,
         torch_compile: bool = False,
+        compile_mode: str = "",
+        fused_attn: bool = True,
+        sequence_parallel: bool = False,
+        gradient_accumulation_steps: int = 1,
         tp_size: int = 1,
     ):
         self.model_name = model_name
@@ -140,6 +151,10 @@ class BenchmarkMetrics:
         self.arch_style = arch_style
         self.activation_checkpointing = activation_checkpointing
         self.torch_compile = torch_compile
+        self.compile_mode = compile_mode
+        self.fused_attn = fused_attn
+        self.sequence_parallel = sequence_parallel
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.tp_size = tp_size
         self.log_interval = 50  # log every N measured steps
 
@@ -263,6 +278,10 @@ class BenchmarkMetrics:
             arch_style=self.arch_style,
             activation_checkpointing=self.activation_checkpointing,
             torch_compile=self.torch_compile,
+            compile_mode=self.compile_mode,
+            fused_attn=self.fused_attn,
+            sequence_parallel=self.sequence_parallel,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
             total_steps=len(self._records),
             warmup_steps=self.warmup_steps,
             flops_per_token=self.flops_per_token,

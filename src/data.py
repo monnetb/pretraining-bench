@@ -178,15 +178,21 @@ def get_dataloader(
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    # For synthetic datasets the data is already in memory, so workers
+    # add overhead and can trigger multiprocessing issues on some platforms
+    # (e.g. GH200 /dev/shm socket errors).  Only use workers for disk-based
+    # datasets that benefit from prefetching.
+    effective_workers = num_workers if dataset_type != "synthetic" else 0
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=num_workers > 0,
+        persistent_workers=effective_workers > 0,
         generator=generator,
     )
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -72,8 +71,10 @@ def create_optimizer(
     if use_fused:
         try:
             from transformer_engine.pytorch.optimizers import FusedAdam
-            optimizer = FusedAdam(param_groups, lr=lr, betas=betas, master_weights=True)
-            logger.info("Using TE FusedAdam optimizer")
+            # master_weights=False saves 4 bytes per parameter (no FP32 copy).
+            # For benchmarking we care about throughput, not convergence quality.
+            optimizer = FusedAdam(param_groups, lr=lr, betas=betas, master_weights=False)
+            logger.info("Using TE FusedAdam optimizer (no master weights)")
             return optimizer
         except (ImportError, Exception) as e:
             logger.warning(f"FusedAdam not available ({e}), falling back to torch AdamW")
@@ -133,6 +134,10 @@ class Trainer:
         lr: float = 3e-4,
         max_grad_norm: float = 1.0,
         use_compile: bool = False,
+        compile_mode: str = "default",
+        gradient_accumulation_steps: int = 1,
+        loss_chunk_size: int = 0,
+        use_te: bool = True,
     ):
         self.model = model
         self.dataloader = dataloader
@@ -142,16 +147,19 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.max_grad_norm = max_grad_norm
         self.use_compile = use_compile
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.loss_chunk_size = loss_chunk_size
+        self.use_te = use_te
 
         # Create optimizer and scheduler
-        self.optimizer = create_optimizer(model, lr=lr)
+        self.optimizer = create_optimizer(model, lr=lr, use_fused=use_te)
         self.scheduler = create_scheduler(
             self.optimizer, num_steps=num_steps, warmup_steps=warmup_steps
         )
 
         # Create precision recipe
         self.recipe = create_recipe(precision_mode)
-        self.use_autocast = precision_mode != PrecisionMode.BF16
+        self.use_autocast = precision_mode != PrecisionMode.BF16 and use_te
 
         # amax_reduction_group is only needed for DelayedScaling (global amax allreduce).
         # MXFP8 and NVFP4 use local block scaling — no distributed amax needed.
@@ -163,13 +171,19 @@ class Trainer:
 
         # Optionally compile the model
         if use_compile:
-            logger.info("Applying torch.compile to model...")
-            self.model = torch.compile(self.model)
+            compile_kwargs = {}
+            if compile_mode and compile_mode != "default":
+                compile_kwargs["mode"] = compile_mode
+            logger.info(f"Applying torch.compile to model (mode={compile_mode})...")
+            self.model = torch.compile(self.model, **compile_kwargs)
 
         logger.info(
             f"Trainer initialized: {num_steps} steps "
             f"({warmup_steps} warmup + {num_steps - warmup_steps} measured), "
             f"precision={precision_mode}, compile={use_compile}"
+            + (f" (mode={compile_mode})" if use_compile else "")
+            + (f", grad_accum={gradient_accumulation_steps}" if gradient_accumulation_steps > 1 else "")
+            + (f", loss_chunks={loss_chunk_size}" if loss_chunk_size > 0 else "")
         )
 
     def train(self) -> None:
@@ -177,6 +191,8 @@ class Trainer:
         Execute the training loop.
 
         Runs warmup + measured steps, collecting metrics along the way.
+        Supports gradient accumulation: each "step" consists of
+        gradient_accumulation_steps micro-batches with scaled loss.
         """
         self.model.train()
         device = next(self.model.parameters()).device
@@ -188,43 +204,68 @@ class Trainer:
         data_iter = iter(self._infinite_loader())
 
         total_steps = self.num_steps
+        accum_steps = self.gradient_accumulation_steps
 
-        logger.info(f"Starting training ({total_steps} steps)...")
+        logger.info(f"Starting training ({total_steps} steps"
+                     + (f", {accum_steps}x grad accum" if accum_steps > 1 else "")
+                     + ")...")
 
         for step in range(total_steps):
-            # Get batch
-            input_ids, targets = next(data_iter)
-            input_ids = input_ids.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-
-            batch_tokens = input_ids.numel()
-
             # --- Forward + Backward + Optimizer Step ---
             self.metrics.start_step(step)
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # Forward pass with optional FP8/FP4 autocast
-            if self.use_autocast:
-                with te.autocast(
-                    enabled=True,
-                    recipe=self.recipe,
-                    amax_reduction_group=self.amax_reduction_group,
-                ):
-                    logits = self.model(input_ids)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        targets.view(-1),
-                    )
-            else:
-                logits = self.model(input_ids)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                )
+            step_loss = 0.0
+            step_tokens = 0
 
-            # Backward
-            loss.backward()
+            for micro_step in range(accum_steps):
+                # Get batch
+                input_ids, targets = next(data_iter)
+                input_ids = input_ids.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                step_tokens += input_ids.numel()
+
+                # Forward pass with optional FP8/FP4 autocast
+                if self.use_autocast:
+                    with te.autocast(
+                        enabled=True,
+                        recipe=self.recipe,
+                        amax_reduction_group=self.amax_reduction_group,
+                    ):
+                        if self.loss_chunk_size > 0:
+                            loss, _ = self.model.forward_with_loss(
+                                input_ids, targets,
+                                loss_chunk_size=self.loss_chunk_size,
+                            )
+                        else:
+                            logits = self.model(input_ids)
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)).float(),
+                                targets.view(-1),
+                            )
+                else:
+                    if self.loss_chunk_size > 0:
+                        loss, _ = self.model.forward_with_loss(
+                            input_ids, targets,
+                            loss_chunk_size=self.loss_chunk_size,
+                        )
+                    else:
+                        logits = self.model(input_ids)
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)).float(),
+                            targets.view(-1),
+                        )
+
+                # Scale loss for gradient accumulation
+                if accum_steps > 1:
+                    loss = loss / accum_steps
+
+                # Backward
+                loss.backward()
+
+                step_loss += loss.item()
 
             # Gradient clipping
             if self.max_grad_norm > 0:
@@ -236,8 +277,8 @@ class Trainer:
             self.optimizer.step()
             self.scheduler.step()
 
-            # Record metrics
-            self.metrics.end_step(step, loss.item(), batch_tokens)
+            # Record metrics (step_loss is already averaged by accum scaling)
+            self.metrics.end_step(step, step_loss, step_tokens)
 
         logger.info("Training complete.")
 

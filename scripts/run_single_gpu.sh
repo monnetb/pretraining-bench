@@ -14,23 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-# ── Activate virtual environment ─────────────────────────────────────────────
-if [ -d "$PROJECT_DIR/.venv" ]; then
-    # shellcheck disable=SC1091
-    source "$PROJECT_DIR/.venv/bin/activate"
-else
-    echo "ERROR: Virtual environment not found. Run ./scripts/setup_venv.sh first." >&2
-    exit 1
-fi
-
-# ── Ensure pip-installed CUDA libs (cuBLAS 13, etc.) are visible to the linker ─
-_SITE_PKGS="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-for _nvidia_lib in "$_SITE_PKGS"/nvidia/*/lib; do
-    [ -d "$_nvidia_lib" ] && export LD_LIBRARY_PATH="${_nvidia_lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-done
-
-# ── Work around cuDNN sublibrary loading failures with TE fused attention ─
-export NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}"
+# ── Shared environment setup (venv, CUDA libs, NCCL, fused attn) ──
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/env_setup.sh"
 
 MODEL_SIZE="${1:-small-gpt2}"
 PRECISION="${2:-bf16}"

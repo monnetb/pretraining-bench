@@ -8,7 +8,7 @@ and creates the appropriate TE recipe objects for each mode.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
@@ -38,7 +38,11 @@ class PrecisionMode(str, Enum):
 # GPU specification database (per-GPU theoretical peak FLOPS)
 # ============================================================================
 # Values are in TFLOPS (teraflops) for a single GPU.
-# Sources: NVIDIA datasheets, product briefs.
+# IMPORTANT: All values are DENSE (without structured sparsity).
+# Structured sparsity (2:4) doubles throughput but is not used in standard
+# training.  Industry-standard MFU calculations (Megatron-LM, PaLM, Llama)
+# use dense TFLOPS as the denominator.
+# Sources: NVIDIA datasheets, product briefs (dense values = sparsity / 2).
 
 @dataclass
 class GPUSpec:
@@ -51,17 +55,24 @@ class GPUSpec:
     nvlink_bw_gbps: float    # per-GPU NVLink bandwidth (GB/s)
 
 # Per-GPU specs (single GPU, not system-level)
+# All TFLOPS values are DENSE (no structured sparsity).
 GPU_SPECS: dict[str, GPUSpec] = {
-    # Blackwell
-    "NVIDIA B300": GPUSpec("B300 SXM", bf16_tflops=4500, fp8_tflops=9000, fp4_tflops=18000, memory_gb=288, nvlink_bw_gbps=225),
-    "NVIDIA B200": GPUSpec("B200 SXM", bf16_tflops=4500, fp8_tflops=9000, fp4_tflops=13500, memory_gb=192, nvlink_bw_gbps=225),
-    # Hopper
-    "NVIDIA H200": GPUSpec("H200 SXM", bf16_tflops=1979, fp8_tflops=3958, fp4_tflops=0, memory_gb=141, nvlink_bw_gbps=112.5),
-    "NVIDIA H100": GPUSpec("H100 SXM", bf16_tflops=1979, fp8_tflops=3958, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=112.5),
-    "NVIDIA H100 80GB HBM3": GPUSpec("H100 SXM", bf16_tflops=1979, fp8_tflops=3958, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=112.5),
-    # Ada Lovelace (PCIe, no NVLink typically)
-    "NVIDIA L40S": GPUSpec("L40S", bf16_tflops=366, fp8_tflops=733, fp4_tflops=0, memory_gb=48, nvlink_bw_gbps=0),
-    # Ampere (no FP8)
+    # Blackwell (SM100) — dense TFLOPS
+    "NVIDIA B300": GPUSpec("B300 SXM", bf16_tflops=2250, fp8_tflops=4500, fp4_tflops=9000, memory_gb=288, nvlink_bw_gbps=225),
+    "NVIDIA GB300": GPUSpec("GB300 NVL72", bf16_tflops=2250, fp8_tflops=4500, fp4_tflops=9000, memory_gb=288, nvlink_bw_gbps=225),
+    "NVIDIA B200": GPUSpec("B200 SXM", bf16_tflops=2250, fp8_tflops=4500, fp4_tflops=6750, memory_gb=192, nvlink_bw_gbps=225),
+    # Hopper (SM90) — dense TFLOPS
+    # H100/H200/GH200 share the same GPU die (GH100): BF16 dense=989, FP8 dense=1979
+    "NVIDIA GH200 480GB": GPUSpec("GH200 480GB", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=480, nvlink_bw_gbps=112.5),
+    "NVIDIA GH200 144GB": GPUSpec("GH200 144GB", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=144, nvlink_bw_gbps=112.5),
+    "NVIDIA GH200 120GB": GPUSpec("GH200 120GB", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=96, nvlink_bw_gbps=112.5),
+    "NVIDIA GH200": GPUSpec("GH200", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=96, nvlink_bw_gbps=112.5),
+    "NVIDIA H200": GPUSpec("H200 SXM", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=141, nvlink_bw_gbps=112.5),
+    "NVIDIA H100": GPUSpec("H100 SXM", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=112.5),
+    "NVIDIA H100 80GB HBM3": GPUSpec("H100 SXM", bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=112.5),
+    # Ada Lovelace (SM89, PCIe) — dense TFLOPS
+    "NVIDIA L40S": GPUSpec("L40S", bf16_tflops=183, fp8_tflops=366, fp4_tflops=0, memory_gb=48, nvlink_bw_gbps=0),
+    # Ampere (SM80, no FP8) — A100 BF16=312 is already the dense number
     "NVIDIA A100": GPUSpec("A100 SXM", bf16_tflops=312, fp8_tflops=0, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=75),
     "NVIDIA A100 80GB PCIe": GPUSpec("A100 PCIe", bf16_tflops=312, fp8_tflops=0, fp4_tflops=0, memory_gb=80, nvlink_bw_gbps=0),
 }
@@ -145,13 +156,14 @@ def detect_gpu_capabilities() -> GPUCapabilities:
             f"estimated values based on compute capability {cc}."
         )
         # Estimate based on compute capability
-        if cc >= (9, 0):   # Blackwell
-            caps.spec = GPUSpec(gpu_name, bf16_tflops=4500, fp8_tflops=9000, fp4_tflops=18000, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=225)
-        elif cc >= (8, 9):  # Ada
-            caps.spec = GPUSpec(gpu_name, bf16_tflops=366, fp8_tflops=733, fp4_tflops=0, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=0)
-        elif cc >= (8, 0):  # Hopper
-            caps.spec = GPUSpec(gpu_name, bf16_tflops=1979, fp8_tflops=3958, fp4_tflops=0, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=112.5)
-        else:               # Ampere or older
+        # SM100+ = Blackwell, SM90 = Hopper, SM89 = Ada Lovelace, SM80-87 = Ampere
+        if cc >= (10, 0):   # Blackwell (B200, B300, GB300) — dense TFLOPS
+            caps.spec = GPUSpec(gpu_name, bf16_tflops=2250, fp8_tflops=4500, fp4_tflops=9000, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=225)
+        elif cc >= (9, 0):  # Hopper (H100, H200, GH200) — dense TFLOPS
+            caps.spec = GPUSpec(gpu_name, bf16_tflops=989, fp8_tflops=1979, fp4_tflops=0, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=112.5)
+        elif cc >= (8, 9):  # Ada Lovelace (L40S) — dense TFLOPS
+            caps.spec = GPUSpec(gpu_name, bf16_tflops=183, fp8_tflops=366, fp4_tflops=0, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=0)
+        else:               # Ampere or older (A100)
             caps.spec = GPUSpec(gpu_name, bf16_tflops=312, fp8_tflops=0, fp4_tflops=0, memory_gb=caps.total_memory_gb, nvlink_bw_gbps=0)
 
     logger.info(f"Detected GPU: {gpu_name} (CC {cc[0]}.{cc[1]})")

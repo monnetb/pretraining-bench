@@ -14,7 +14,6 @@ import json
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from .metrics import BenchmarkResult
@@ -44,6 +43,10 @@ CSV_COLUMNS = [
     "final_loss",
     "activation_checkpointing",
     "torch_compile",
+    "compile_mode",
+    "fused_attn",
+    "sequence_parallel",
+    "gradient_accumulation_steps",
     "tp_size",
 ]
 
@@ -216,7 +219,7 @@ def print_single_result(result: BenchmarkResult) -> None:
     print(f"  GPU:            {result.gpu_name} × {result.num_gpus}{tp_info}")
     print(f"  Parameters:     {result.num_params:,}")
     print(f"  Batch × Seq:    {result.batch_size} × {result.seq_length}")
-    print(f"  ──────────────────────────────────────────")
+    print("  ──────────────────────────────────────────")
     print(f"  Throughput:     {result.tokens_per_second:,.0f} tok/s")
     print(f"  TFLOPS:         {result.achieved_tflops:.1f}")
     print(f"  MFU:            {result.mfu:.1%}")

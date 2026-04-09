@@ -32,7 +32,6 @@ import argparse
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -62,8 +61,8 @@ def parse_args() -> argparse.Namespace:
             "Model config name from model_configs.yaml. "
             "Use 'all' to run all models, or specify comma-separated names. "
             "Available: small-gpt2, small-llama, medium-gpt2, medium-llama, "
-            "large-gpt2, large-llama, xlarge-gpt2, xlarge-llama, 8b-llama, "
-            "30b-llama, 70b-llama"
+            "large-gpt2, large-llama, xlarge-gpt2, xlarge-llama, 3b-llama, "
+            "8b-llama, 30b-llama, 70b-llama"
         ),
     )
 
@@ -121,6 +120,10 @@ def parse_args() -> argparse.Namespace:
         "--max-grad-norm", type=float, default=1.0,
         help="Gradient clipping max norm (0 to disable)",
     )
+    train_group.add_argument(
+        "--gradient-accumulation-steps", type=int, default=1,
+        help="Number of micro-batches to accumulate before optimizer step",
+    )
 
     # Parallelism
     par_group = parser.add_argument_group("Parallelism")
@@ -130,6 +133,14 @@ def parse_args() -> argparse.Namespace:
             "Tensor parallelism size. Must divide world_size evenly. "
             "dp_size = world_size / tp_size. Use tp_size > 1 for models "
             "that don't fit with FSDP-only (e.g., 70b-llama)."
+        ),
+    )
+    par_group.add_argument(
+        "--sequence-parallel", action="store_true",
+        help=(
+            "Enable sequence parallelism (requires --tp-size > 1). "
+            "Shards activations along the sequence dimension across TP ranks "
+            "to reduce activation memory."
         ),
     )
 
@@ -142,6 +153,40 @@ def parse_args() -> argparse.Namespace:
     opt_group.add_argument(
         "--use-compile", action="store_true",
         help="Apply torch.compile to the model",
+    )
+    opt_group.add_argument(
+        "--compile-mode", type=str, default="default",
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help=(
+            "torch.compile mode (only used with --use-compile). "
+            "'reduce-overhead' uses CUDA graphs for lower kernel launch overhead. "
+            "'max-autotune' enables aggressive autotuning (slower compile)."
+        ),
+    )
+    opt_group.add_argument(
+        "--no-fused-attn", action="store_true", default=False,
+        help=(
+            "Disable TransformerEngine fused (flash) attention. "
+            "By default, fused attention is enabled for better throughput and memory. "
+            "Use this flag if cuDNN sublibrary loading fails."
+        ),
+    )
+    opt_group.add_argument(
+        "--loss-chunk-size", type=int, default=0,
+        help=(
+            "Compute cross-entropy loss in chunks of this many tokens along "
+            "the sequence dimension. Avoids materializing the full (B*S, vocab) "
+            "logit tensor, saving ~1 GB per batch element. 0 = disabled (default). "
+            "Recommended: 256 or 512 for memory-constrained runs."
+        ),
+    )
+    opt_group.add_argument(
+        "--no-te", action="store_true", default=False,
+        help=(
+            "Use pure-PyTorch model instead of TransformerEngine layers. "
+            "BF16 only (no FP8), no TP, but works on GPUs where TE's custom "
+            "CUDA kernels are unsupported (e.g., B300 SXM6 AC at CC 10.3)."
+        ),
     )
 
     # Sweep
@@ -217,7 +262,7 @@ def run_single_benchmark(
 
     from .model import load_model_config, build_model, compute_flops_per_token
     from .data import get_dataloader
-    from .metrics import BenchmarkMetrics, BenchmarkResult, reset_memory_stats
+    from .metrics import BenchmarkMetrics, reset_memory_stats
     from .precision import PrecisionMode, get_available_precisions
     from .trainer import Trainer
     from .distributed import apply_fsdp2, apply_activation_checkpointing, is_main_process
@@ -254,7 +299,12 @@ def run_single_benchmark(
     # Build model with TP support
     device = torch.device("cuda")
     tp_group = parallel_groups.tp_group if parallel_groups else None
-    model = build_model(model_config, device=device, tp_group=tp_group, tp_size=tp_size)
+    use_sp = args.sequence_parallel and tp_size > 1
+    if args.sequence_parallel and tp_size <= 1:
+        if is_main_process():
+            logger.warning("--sequence-parallel ignored: requires --tp-size > 1")
+    model = build_model(model_config, device=device, tp_group=tp_group, tp_size=tp_size,
+                        sequence_parallel=use_sp, use_te=not args.no_te)
 
     # Get parameter counts — use config-level count for total (architecture-level, independent of TP)
     num_params = model_config.num_params_approx
@@ -282,6 +332,9 @@ def run_single_benchmark(
         dp_size=dp_size if dp_size > 1 else None,
     )
 
+    # Determine fused_attn state
+    fused_attn = os.environ.get("NVTE_FUSED_ATTN", "1") != "0"
+
     # Create metrics collector
     metrics = BenchmarkMetrics(
         model_name=model_name,
@@ -296,6 +349,10 @@ def run_single_benchmark(
         arch_style=model_config.arch_style,
         activation_checkpointing=args.activation_checkpointing,
         torch_compile=args.use_compile,
+        compile_mode=args.compile_mode if args.use_compile else "",
+        fused_attn=fused_attn,
+        sequence_parallel=use_sp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         tp_size=tp_size,
     )
 
@@ -310,6 +367,10 @@ def run_single_benchmark(
         lr=args.lr,
         max_grad_norm=args.max_grad_norm,
         use_compile=args.use_compile,
+        compile_mode=args.compile_mode,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        loss_chunk_size=args.loss_chunk_size,
+        use_te=not args.no_te,
     )
 
     # Reset memory tracking
@@ -338,9 +399,27 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # --- Configure fused attention BEFORE importing TransformerEngine ---
+    # TE reads NVTE_FUSED_ATTN at import time, so this must come first.
+    if args.no_fused_attn or args.no_te:
+        os.environ["NVTE_FUSED_ATTN"] = "0"
+    elif "NVTE_FUSED_ATTN" not in os.environ:
+        os.environ["NVTE_FUSED_ATTN"] = "1"
+    fused_attn_enabled = os.environ.get("NVTE_FUSED_ATTN", "1") != "0"
+
+    # --no-te forces BF16 (FP8 requires TE)
+    if args.no_te and args.precision not in ("bf16", "auto"):
+        logger.warning(f"--no-te forces precision=bf16 (was {args.precision})")
+        args.precision = "bf16"
+
     # Lazy imports — allows --help to work without torch/TE installed
     import torch
     import yaml
+
+    # --- Performance: enable TF32 for any stray FP32 matmuls & convolutions ---
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     # --- Distributed setup ---
     from .distributed import (
@@ -386,13 +465,13 @@ def main():
             detect_gpu_capabilities,
             get_available_precisions,
             precision_summary,
-            PrecisionMode,
         )
 
         gpu_caps = detect_gpu_capabilities()
 
         if is_main_process():
             logger.info(f"\n{precision_summary(gpu_caps)}\n")
+            logger.info(f"Fused attention: {'enabled' if fused_attn_enabled else 'disabled'}")
 
         # --- Load model configs ---
         config_path = find_config_path(args.config_path)
@@ -423,7 +502,10 @@ def main():
         # --- Determine which precisions to test ---
         available_precisions = get_available_precisions(gpu_caps)
 
-        if args.sweep or args.precision == "all":
+        if args.no_te:
+            # Pure-PyTorch: only BF16 is supported
+            precision_modes = ["bf16"]
+        elif args.sweep or args.precision == "all":
             precision_modes = [str(p) for p in available_precisions]
         elif args.precision == "auto":
             # Use the best available precision
@@ -470,6 +552,55 @@ def main():
                     )
                     if result is not None:
                         all_results.append(result)
+                except RuntimeError as e:
+                    err_msg = str(e)
+                    # Graceful fallback: cuDNN sublibrary loading failure means
+                    # fused attention can't work with the installed cuDNN.
+                    # Disable it and retry the benchmark automatically.
+                    if (
+                        "SUBLIBRARY_LOADING_FAILED" in err_msg
+                        and os.environ.get("NVTE_FUSED_ATTN", "1") != "0"
+                    ):
+                        if is_main_process():
+                            logger.warning(
+                                "cuDNN sublibrary loading failed — disabling "
+                                "fused attention and retrying. To silence this "
+                                "warning, pass --no-fused-attn or set "
+                                "NVTE_FUSED_ATTN=0."
+                            )
+                        os.environ["NVTE_FUSED_ATTN"] = "0"
+                        torch.cuda.empty_cache()
+                        barrier()
+                        try:
+                            result = run_single_benchmark(
+                                model_name=model_name,
+                                precision_mode_str=prec,
+                                args=args,
+                                config_data=config_data,
+                                gpu_caps=gpu_caps,
+                                rank=rank,
+                                world_size=world_size,
+                                parallel_groups=parallel_groups,
+                            )
+                            if result is not None:
+                                all_results.append(result)
+                        except Exception as e2:
+                            if is_main_process():
+                                logger.error(
+                                    f"Benchmark failed for {model_name}@{prec} "
+                                    f"(retry without fused attn): {e2}",
+                                    exc_info=True,
+                                )
+                            torch.cuda.empty_cache()
+                            continue
+                    else:
+                        if is_main_process():
+                            logger.error(
+                                f"Benchmark failed for {model_name}@{prec}: {e}",
+                                exc_info=True,
+                            )
+                        torch.cuda.empty_cache()
+                        continue
                 except Exception as e:
                     if is_main_process():
                         logger.error(

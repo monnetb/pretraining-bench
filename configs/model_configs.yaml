@@ -118,6 +118,21 @@ models:
     max_seq_length: 2048
 
   # --------------------------------------------------------------------------
+  # 3B — Fills H100 80 GB memory with batch ≥ 4 for high MFU
+  # --------------------------------------------------------------------------
+  3b-llama:
+    arch_style: llama
+    hidden_size: 3072
+    num_attention_heads: 24
+    num_layers: 28
+    ffn_hidden_size: 10752
+    num_gqa_groups: 8
+    normalization: RMSNorm
+    activation: swiglu
+    bias: false
+    max_seq_length: 2048
+
+  # --------------------------------------------------------------------------
   # 8B — Llama 3 8B architecture (single H200 or multi-GPU)
   # --------------------------------------------------------------------------
   8b-llama:
